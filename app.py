@@ -23,7 +23,7 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "support@xpulselabs.com")
-resend.api_key = re_8qyap4KU_3TfZ8D6tyb7QMAYGtippGKu1
+resend.api_key = RESEND_API_KEY
 
 def verify_signature(raw_body: bytes, signature: str) -> bool:
     digest = hmac.new(

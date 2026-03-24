@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import string
 from datetime import datetime, timezone
+import resend
 
 from flask import Flask, request, jsonify
 import firebase_admin
@@ -20,7 +21,9 @@ service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
 cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
-
+RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "support@xpulselabs.com")
+resend.api_key = re_8qyap4KU_3TfZ8D6tyb7QMAYGtippGKu1
 
 def verify_signature(raw_body: bytes, signature: str) -> bool:
     digest = hmac.new(
@@ -41,6 +44,22 @@ def generate_license_key() -> str:
     ]
     return "XP-" + "-".join(parts)
 
+def send_license_email(customer_email: str, license_key: str):
+    if not customer_email:
+        return
+
+    resend.Emails.send({
+        "from": f"XPulse Pro <{FROM_EMAIL}>",
+        "to": [customer_email],
+        "subject": "Your XPulse Pro license key",
+        "html": f"""
+        <h2>Your XPulse Pro license key</h2>
+        <p>Thank you for your purchase.</p>
+        <p><strong>License Key:</strong> {license_key}</p>
+        <p>Open XPulse Pro, paste your key into the activation screen, and click <strong>Activate</strong>.</p>
+        <p>If you need help, reply to this email.</p>
+        """
+    })
 
 def get_or_create_license_for_subscription(subscription_id: str, customer_email: str, product_name: str):
     # Aynı subscription için ikinci kez key üretme
@@ -112,6 +131,11 @@ def webhook():
             product_name=product_name,
         )
 
+        send_license_email(customer_email, license_key)
+        if customer_email:
+            send_license_email(customer_email, license_key)
+
+        
         # İstersen burada ayrıca "orders" koleksiyonuna log da atabilirsin
         db.collection("webhook_logs").add({
             "event": event_name,

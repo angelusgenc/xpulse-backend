@@ -8,6 +8,7 @@ import resend
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
+from datetime import timedelta
 
 app = Flask(__name__)
 
@@ -83,30 +84,63 @@ def get_or_create_license(source_id: str, customer_email: str, product_name: str
         .stream()
     )
     existing = list(existing)
+
+    now = utc_now()
+
+    # PLAN SÜRESİ
+    if plan_name == "monthly":
+        delta = timedelta(days=30)
+    elif plan_name == "yearly":
+        delta = timedelta(days=365)
+    else:
+        delta = timedelta(days=0)
+
+    # 🔥 VARSA → SÜRE UZAT
     if existing:
         doc = existing[0]
-        return doc.id, doc.to_dict(), False
+        license_key = doc.id
+        license_data = doc.to_dict()
 
+        current_expiry = license_data.get("expires_at")
+
+        if current_expiry and current_expiry > now:
+            new_expiry = current_expiry + delta
+        else:
+            new_expiry = now + delta
+
+        db.collection("licenses").document(license_key).update({
+            "expires_at": new_expiry,
+            "updated_at": now
+        })
+
+        return license_key, license_data, False
+
+    # 🔥 YOKSA → YENİ OLUŞTUR
     while True:
         license_key = generate_license_key()
         doc_ref = db.collection("licenses").document(license_key)
         if not doc_ref.get().exists:
             break
 
+    expires_at = now + delta if delta else None
+
     payload = {
         "active": True,
         "used": False,
         "device_id": "",
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
+        "created_at": now,
+        "updated_at": now,
         "customer_email": customer_email or "",
         "product_name": product_name or "XPulse Pro",
         "plan_name": plan_name or "unknown",
         "source": "gumroad",
         "source_id": source_id,
         "raw": raw_data,
+        "expires_at": expires_at,
     }
+
     db.collection("licenses").document(license_key).set(payload)
+
     return license_key, payload, True
 
 

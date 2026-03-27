@@ -1,37 +1,32 @@
 import os
 import json
-import hmac
-import hashlib
 import secrets
 import string
 from datetime import datetime, timezone
-import resend
 
+import resend
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "support@xpulselabs.com")
+GUMROAD_SELLER_ID = os.environ.get("GUMROAD_SELLER_ID", "").strip()
 
 # Firebase init
 service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
 cred = credentials.Certificate(service_account_info)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
-RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "support@xpulselabs.com")
+
 resend.api_key = RESEND_API_KEY
 
-def verify_signature(raw_body: bytes, signature: str) -> bool:
-    digest = hmac.new(
-        WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(digest, signature or "")
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
 def generate_license_key() -> str:
@@ -43,6 +38,7 @@ def generate_license_key() -> str:
         "".join(secrets.choice(alphabet) for _ in range(4)),
     ]
     return "XP-" + "-".join(parts)
+
 
 def send_license_email(customer_email: str, license_key: str):
     if not customer_email:
@@ -61,20 +57,36 @@ def send_license_email(customer_email: str, license_key: str):
         """
     })
 
-def get_or_create_license_for_subscription(subscription_id: str, customer_email: str, product_name: str):
-    # Aynı subscription için ikinci kez key üretme
+
+def parse_plan_name(data: dict) -> str:
+    candidates = [
+        data.get("price_name", ""),
+        data.get("variant", ""),
+        data.get("variants_and_quantity", ""),
+        data.get("product_name", ""),
+    ]
+    joined = " | ".join([str(x) for x in candidates if x]).lower()
+
+    if "year" in joined or "annual" in joined or "yearly" in joined:
+        return "yearly"
+    if "month" in joined or "monthly" in joined:
+        return "monthly"
+    return "unknown"
+
+
+def get_or_create_license(source_id: str, customer_email: str, product_name: str, plan_name: str, raw_data: dict):
     existing = (
         db.collection("licenses")
-        .where("subscription_id", "==", subscription_id)
+        .where("source", "==", "gumroad")
+        .where("source_id", "==", source_id)
         .limit(1)
         .stream()
     )
     existing = list(existing)
     if existing:
         doc = existing[0]
-        return doc.id, doc.to_dict()
+        return doc.id, doc.to_dict(), False
 
-    # Unique key üret
     while True:
         license_key = generate_license_key()
         doc_ref = db.collection("licenses").document(license_key)
@@ -85,94 +97,97 @@ def get_or_create_license_for_subscription(subscription_id: str, customer_email:
         "active": True,
         "used": False,
         "device_id": "",
-        "created_at": datetime.now(timezone.utc),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
         "customer_email": customer_email or "",
-        "subscription_id": subscription_id or "",
-        "product_name": product_name or "",
-        "source": "lemon_squeezy",
+        "product_name": product_name or "XPulse Pro",
+        "plan_name": plan_name or "unknown",
+        "source": "gumroad",
+        "source_id": source_id,
+        "raw": raw_data,
     }
     db.collection("licenses").document(license_key).set(payload)
-    return license_key, payload
+    return license_key, payload, True
 
 
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "service": "xpulse-backend"}), 200
+    return jsonify({"ok": True, "service": "xpulse-backend", "provider": "gumroad"}), 200
 
 
-@app.post("/webhook")
-def webhook():
-    raw_body = request.get_data()
-    signature = request.headers.get("X-Signature", "")
-    event_name = request.headers.get("X-Event-Name", "")
+@app.post("/webhook/gumroad")
+def gumroad_webhook():
+    data = request.form.to_dict(flat=True)
 
-    if not verify_signature(raw_body, signature):
-        return jsonify({"ok": False, "error": "invalid signature"}), 401
+    db.collection("webhook_logs").add({
+        "provider": "gumroad",
+        "kind": "incoming",
+        "payload": data,
+        "created_at": utc_now(),
+    })
 
-    payload = request.get_json(silent=True) or {}
-    data = payload.get("data", {})
-    attributes = data.get("attributes", {})
-    meta = payload.get("meta", {})
-
-    # Subscription ilk oluştuğunda license üret
-    if event_name == "subscription_created":
-        subscription_id = str(data.get("id", ""))
-        customer_email = (
-            attributes.get("user_email")
-            or attributes.get("customer_email")
-            or meta.get("custom_data", {}).get("email")
-            or ""
-        )
-        product_name = attributes.get("product_name", "Xpulse Pro")
-
-        license_key, _ = get_or_create_license_for_subscription(
-            subscription_id=subscription_id,
-            customer_email=customer_email,
-            product_name=product_name,
-        )
-
-        send_license_email(customer_email, license_key)
-        if customer_email:
-            send_license_email(customer_email, license_key)
-
-        
-        # İstersen burada ayrıca "orders" koleksiyonuna log da atabilirsin
+    # Optional seller validation
+    incoming_seller_id = (data.get("seller_id") or "").strip()
+    if GUMROAD_SELLER_ID and incoming_seller_id != GUMROAD_SELLER_ID:
         db.collection("webhook_logs").add({
-            "event": event_name,
-            "subscription_id": subscription_id,
+            "provider": "gumroad",
+            "kind": "rejected_seller_id",
+            "payload": data,
+            "created_at": utc_now(),
+        })
+        return jsonify({"ok": False, "error": "invalid seller_id"}), 403
+
+    # Gumroad test ping may not include normal purchase fields.
+    customer_email = (data.get("email") or data.get("purchaser_email") or "").strip().lower()
+    product_name = (data.get("product_name") or "XPulse Pro").strip()
+    plan_name = parse_plan_name(data)
+
+    # Prefer recurring subscription id when present so renewals reuse same key.
+    source_id = (
+        data.get("subscription_id")
+        or data.get("subscription_token")
+        or data.get("sale_id")
+        or data.get("purchase_id")
+        or data.get("order_id")
+        or ""
+    ).strip()
+
+    if not customer_email or not source_id:
+        return jsonify({
+            "ok": True,
+            "message": "ping received",
+            "license_created": False
+        }), 200
+
+    license_key, _, created = get_or_create_license(
+        source_id=source_id,
+        customer_email=customer_email,
+        product_name=product_name,
+        plan_name=plan_name,
+        raw_data=data,
+    )
+
+    if created:
+        send_license_email(customer_email, license_key)
+
+        db.collection("webhook_logs").add({
+            "provider": "gumroad",
+            "kind": "license_created",
             "customer_email": customer_email,
             "license_key": license_key,
-            "created_at": datetime.now(timezone.utc),
+            "source_id": source_id,
+            "plan_name": plan_name,
+            "created_at": utc_now(),
         })
 
-        return jsonify({"ok": True, "license_key": license_key}), 200
+    return jsonify({
+        "ok": True,
+        "license_created": created,
+        "license_key": license_key,
+        "plan_name": plan_name,
+    }), 200
 
-    # Subscription iptal / expiry olursa lisansı pasife çek
-    if event_name in {"subscription_expired", "subscription_cancelled"}:
-        subscription_id = str(data.get("id", ""))
-        docs = (
-            db.collection("licenses")
-            .where("subscription_id", "==", subscription_id)
-            .limit(10)
-            .stream()
-        )
-        for doc in docs:
-            doc.reference.update({
-                "active": False,
-                "updated_at": datetime.now(timezone.utc),
-            })
 
-        db.collection("webhook_logs").add({
-            "event": event_name,
-            "subscription_id": subscription_id,
-            "created_at": datetime.now(timezone.utc),
-        })
-
-        return jsonify({"ok": True}), 200
-
-    # Geri kalan event'leri şimdilik sadece kabul et
-    db.collection("webhook_logs").add({
-        "event": event_name,
-        "created_at": datetime.now(timezone.utc),
-    })
-    return jsonify({"ok": True, "ignored": event_name}), 200
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

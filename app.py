@@ -60,18 +60,27 @@ def send_license_email(customer_email: str, license_key: str):
 
 
 def parse_plan_name(data: dict) -> str:
-    candidates = [
-        data.get("price_name", ""),
-        data.get("variant", ""),
-        data.get("variants_and_quantity", ""),
-        data.get("product_name", ""),
-    ]
-    joined = " | ".join([str(x) for x in candidates if x]).lower()
+    recurrence = str(data.get("recurrence", "")).strip().lower()
+    tier = str(data.get("variants[Tier]", "")).strip().lower()
+    price_name = str(data.get("price_name", "")).strip().lower()
+    variant = str(data.get("variant", "")).strip().lower()
+    variants_and_quantity = str(data.get("variants_and_quantity", "")).strip().lower()
+    product_name = str(data.get("product_name", "")).strip().lower()
 
-    if "year" in joined or "annual" in joined or "yearly" in joined:
-        return "yearly"
-    if "month" in joined or "monthly" in joined:
+    joined = " | ".join(
+        x for x in [recurrence, tier, price_name, variant, variants_and_quantity, product_name] if x
+    )
+
+    if recurrence == "monthly":
         return "monthly"
+    if recurrence in ("yearly", "annual"):
+        return "yearly"
+
+    if any(word in joined for word in ["year", "annual", "yearly"]):
+        return "yearly"
+    if any(word in joined for word in ["month", "monthly"]):
+        return "monthly"
+
     return "unknown"
 
 
